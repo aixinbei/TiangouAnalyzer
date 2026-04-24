@@ -16,6 +16,7 @@ import time
 import traceback
 import webbrowser
 import builtins
+import socket
 from builtins import open as builtin_open
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
@@ -32,6 +33,7 @@ import zstandard as zstd
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 HOST = "127.0.0.1"
 PORT = 8876
+PORT_CANDIDATES = [8876, 8877, 8878, 8879, 8880]
 IDLE_EXIT_SECONDS = 120
 LOCAL_VENDOR = ROOT / "vendor" / "wechat-decrypt"
 SHARED_VENDOR = ROOT.parent / "vendor" / "wechat-decrypt"
@@ -211,6 +213,39 @@ def cleanup_sensitive_artifacts(clear_memory_keys: bool = True) -> None:
     if clear_memory_keys:
         global MEMORY_KEYS_RESULT
         MEMORY_KEYS_RESULT = None
+
+
+def write_startup_log(message: str) -> None:
+    executable_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+    log_dir = executable_dir / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "startup_error.log").write_text(message, encoding="utf-8")
+
+
+def append_runtime_log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+    executable_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+    log_dir = executable_dir / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "runtime.log").open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def create_server() -> ThreadingHTTPServer:
+    global PORT
+    last_error: Exception | None = None
+    for candidate in PORT_CANDIDATES:
+        try:
+            server = ThreadingHTTPServer((HOST, candidate), AppHandler)
+            PORT = candidate
+            append_runtime_log(f"本地服务启动端口已选定: {HOST}:{PORT}")
+            return server
+        except OSError as exc:
+            last_error = exc
+            append_runtime_log(f"端口 {candidate} 不可用，尝试下一个")
+            continue
+    raise last_error or RuntimeError("无法启动本地服务")
 
 
 def vendor_ready() -> list[str]:
@@ -837,18 +872,30 @@ class AppHandler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     os.chdir(ROOT)
+    append_runtime_log("程序启动")
     cleanup_sensitive_artifacts(clear_memory_keys=True)
-    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+    append_runtime_log("已清理上次运行残留")
+    server = create_server()
     start_idle_shutdown_watch(server)
+    append_runtime_log("空闲自动退出监视已启动")
     print(f"WeChat easy analyzer running at http://{HOST}:{PORT}")
+    append_runtime_log(f"准备打开浏览器: http://{HOST}:{PORT}")
     threading.Timer(0.8, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
     try:
         server.serve_forever()
     finally:
+        append_runtime_log("程序退出，开始清理临时数据")
         cleanup_sensitive_artifacts(clear_memory_keys=True)
+        append_runtime_log("临时数据清理完成")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--run-vendor-script":
-        sys.exit(run_vendor_script_inline(sys.argv[2]))
-    main()
+    try:
+        if len(sys.argv) >= 3 and sys.argv[1] == "--run-vendor-script":
+            sys.exit(run_vendor_script_inline(sys.argv[2]))
+        main()
+    except Exception:
+        error_text = traceback.format_exc()
+        append_runtime_log("程序启动失败，已写入 startup_error.log")
+        write_startup_log(error_text)
+        raise
