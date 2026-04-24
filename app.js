@@ -6,6 +6,8 @@ const state = {
   selectedSessionIndex: null,
 };
 
+let logSequence = 0;
+
 const els = {
   runtimeText: document.getElementById("runtimeText"),
   progressFill: document.getElementById("progressFill"),
@@ -45,9 +47,11 @@ boot();
 
 async function boot() {
   try {
+    await logClientEvent("page_boot");
     await fetch("/api/health", { cache: "no-store" });
     await refreshRuntime();
   } catch (error) {
+    await logClientEvent("boot_failed", { message: String(error && error.message || error) });
     els.runtimeText.textContent = "还没有启动成功，请先运行 start_app.bat";
   }
 }
@@ -55,6 +59,11 @@ async function boot() {
 async function refreshRuntime() {
   const res = await fetch("/api/wechat/runtime", { cache: "no-store" });
   const payload = await res.json();
+  await logClientEvent("runtime_refreshed", {
+    accountCount: payload.account_count || 0,
+    decryptedReady: Boolean(payload.decrypted_ready),
+    problems: payload.problems || [],
+  });
   const problems = payload.problems || [];
   els.runtimeText.textContent = problems.length
     ? "还差一点环境准备，先按下面提示处理"
@@ -67,9 +76,11 @@ async function refreshRuntime() {
 }
 
 async function runOneClickParse() {
+  const manualDir = els.manualDir.value.trim();
+  await logClientEvent("parse_clicked", { hasManualDir: Boolean(manualDir), manualDir });
   const params = new URLSearchParams();
-  if (els.manualDir.value.trim()) {
-    params.set("manual_dir", els.manualDir.value.trim());
+  if (manualDir) {
+    params.set("manual_dir", manualDir);
   }
   setProgress(10, "正在检查微信是否已登录...");
   const progressMessages = [
@@ -82,6 +93,12 @@ async function runOneClickParse() {
   );
   const res = await fetch(`/api/wechat/parse?${params.toString()}`, { method: "POST" });
   const payload = await res.json();
+  await logClientEvent("parse_response", {
+    ok: Boolean(payload.ok),
+    error: payload.error || "",
+    tips: payload.tips || [],
+    contactCount: payload.contact_count || 0,
+  });
   timers.forEach((timer) => clearTimeout(timer));
   if (payload.ok) {
     setProgress(100, "解析完成，可以直接选择联系人了");
@@ -101,6 +118,7 @@ async function runOneClickParse() {
 async function loadContacts() {
   const res = await fetch("/api/wechat/contacts", { cache: "no-store" });
   const payload = await res.json();
+  await logClientEvent("contacts_loaded", { count: (payload.items || []).length });
   state.contacts = (payload.items || []).map((item) => ({
     id: item.username,
     name: item.display_name,
@@ -135,6 +153,7 @@ function renderContacts() {
 
   Array.from(els.contactList.querySelectorAll(".contact-item")).forEach((button) => {
     button.addEventListener("click", async () => {
+      await logClientEvent("contact_selected", { username: button.dataset.id });
       state.selectedContactId = button.dataset.id;
       state.selectedSessionIndex = null;
       renderContacts();
@@ -149,8 +168,15 @@ function setProgress(percent, text) {
 }
 
 async function analyzeContact(username) {
+  await logClientEvent("analyze_clicked", { username });
   const res = await fetch(`/api/wechat/analyze?username=${encodeURIComponent(username)}`, { cache: "no-store" });
   const payload = await res.json();
+  await logClientEvent("analyze_response", {
+    username,
+    ready: Boolean(payload.ready),
+    messageCount: payload.message_count || 0,
+    sessionCount: payload.session_count || 0,
+  });
   const index = state.contacts.findIndex((item) => item.id === username);
   if (index < 0) {
     return;
@@ -235,9 +261,33 @@ function renderResult() {
       return;
     }
     const index = Number(button.dataset.index);
+    logClientEvent("session_toggle", { index, opened: state.selectedSessionIndex !== index });
     state.selectedSessionIndex = state.selectedSessionIndex === index ? null : index;
     renderResult();
   };
+}
+
+async function logClientEvent(event, details = {}) {
+  logSequence += 1;
+  const payload = {
+    event,
+    details: {
+      ...details,
+      seq: logSequence,
+      page: "main",
+      selectedContactId: state.selectedContactId || "",
+      timestamp: new Date().toISOString(),
+    },
+  };
+  try {
+    await fetch("/api/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    // Ignore logging failures so they never break the main flow.
+  }
 }
 
 function renderSessionRow(session, index) {

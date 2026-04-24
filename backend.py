@@ -89,20 +89,11 @@ def find_xwechat_db_dirs() -> list[Path]:
         except Exception:
             continue
 
-        if not content:
-            continue
-
-        root = Path(content) / "xwechat_files"
-        if not root.exists():
-            continue
-
-        for child in sorted(root.iterdir()):
-            db_dir = child / "db_storage"
-            if db_dir.exists():
-                normalized = str(db_dir).lower()
-                if normalized not in seen:
-                    seen.add(normalized)
-                    roots.append(db_dir)
+        for db_dir in guess_wechat_data_dirs_from_text(content):
+            normalized = str(db_dir).lower()
+            if normalized not in seen:
+                seen.add(normalized)
+                roots.append(db_dir)
     return roots
 
 
@@ -174,7 +165,90 @@ def normalize_manual_dir(raw_path: str) -> Path:
         raise RuntimeError("请先输入微信聊天记录目录")
     if not path.exists():
         raise RuntimeError(f"目录不存在：{path}")
-    return path
+    matched = guess_wechat_data_dirs_from_path(path)
+    if matched:
+        return matched[0]
+    raise RuntimeError("这个目录里没有找到可用的微信聊天记录，请尽量选到微信聊天记录所在文件夹。")
+
+
+def guess_wechat_data_dirs_from_text(raw_text: str) -> list[Path]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return []
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    lines = [line.strip().strip('"').strip("'") for line in text.splitlines() if line.strip()]
+    for line in lines:
+        possible_values = [line]
+        if "=" in line:
+            possible_values.append(line.split("=", 1)[1].strip().strip('"').strip("'"))
+        if ":" in line and not re.match(r"^[A-Za-z]:\\", line):
+            possible_values.append(line.split(":", 1)[1].strip().strip('"').strip("'"))
+        for value in possible_values:
+            if not value:
+                continue
+            for path in guess_wechat_data_dirs_from_path(Path(value).expanduser()):
+                normalized = str(path).lower()
+                if normalized not in seen:
+                    seen.add(normalized)
+                    candidates.append(path)
+    return candidates
+
+
+def guess_wechat_data_dirs_from_path(path: Path) -> list[Path]:
+    try:
+        path = path.resolve()
+    except Exception:
+        path = Path(path)
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(candidate: Path) -> None:
+        normalized = str(candidate).lower()
+        if candidate.exists() and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(candidate)
+
+    if not path.exists():
+        return []
+
+    if path.name.lower() == "db_storage":
+        add(path)
+    if path.name.lower() == "msg":
+        add(path)
+
+    direct_children = []
+    try:
+        direct_children = list(path.iterdir()) if path.is_dir() else []
+    except Exception:
+        direct_children = []
+
+    if path.is_dir():
+        if (path / "message").exists() and any(path.glob("**/*.db")):
+            add(path)
+        if (path / "MicroMsg.db").exists() or any(path.glob("MSG*.db")):
+            add(path)
+        if (path / "xwechat_files").exists():
+            for child in (path / "xwechat_files").iterdir():
+                if child.is_dir() and (child / "db_storage").exists():
+                    add(child / "db_storage")
+        if (path / "db_storage").exists():
+            add(path / "db_storage")
+        if (path / "Msg").exists():
+            add(path / "Msg")
+        if path.name.lower() == "xwechat_files":
+            for child in direct_children:
+                if child.is_dir() and (child / "db_storage").exists():
+                    add(child / "db_storage")
+        if path.name.lower() == "wechat files":
+            ignored = {"all users", "applet", "wmpf"}
+            for child in direct_children:
+                if child.is_dir() and child.name.lower() not in ignored and (child / "Msg").exists():
+                    add(child / "Msg")
+
+    return candidates
 
 
 def resolve_target_dir(index: int | None = None, manual_dir: str = "") -> tuple[Path, str]:
@@ -230,6 +304,11 @@ def append_runtime_log(message: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     with (log_dir / "runtime.log").open("a", encoding="utf-8") as fh:
         fh.write(line)
+
+
+def log_operation(stage: str, **fields: Any) -> None:
+    detail = " ".join(f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in fields.items())
+    append_runtime_log(f"{stage}{' | ' + detail if detail else ''}")
 
 
 def create_server() -> ThreadingHTTPServer:
@@ -732,8 +811,10 @@ def list_contacts() -> list[dict[str, Any]]:
 
 
 def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]:
+    log_operation("解析开始", mode="manual" if manual_dir.strip() else ("selected" if index is not None else "auto"), manual_dir=manual_dir)
     problems = vendor_ready()
     if problems:
+        log_operation("解析失败", reason="vendor_not_ready", problems=problems)
         return {
             "ok": False,
             "error": "程序运行环境还没准备好",
@@ -743,7 +824,9 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
     try:
         target_dir, source = resolve_target_dir(index=index, manual_dir=manual_dir)
         config = ensure_vendor_config(target_dir)
+        log_operation("目录已确定", source=source, target_dir=str(target_dir))
     except Exception as exc:
+        log_operation("解析失败", reason="resolve_target_dir_failed", error=str(exc), manual_dir=manual_dir, index=index)
         return {
             "ok": False,
             "error": str(exc),
@@ -763,6 +846,13 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
 
     key_result = run_vendor_script("find_all_keys.py")
     if not key_result.get("ok"):
+        log_operation(
+            "解析失败",
+            reason="keys_failed",
+            returncode=key_result.get("returncode"),
+            stderr=(key_result.get("stderr") or "")[:300],
+            stdout=(key_result.get("stdout") or "")[:300],
+        )
         return {
             "ok": False,
             "error": "解析失败",
@@ -777,6 +867,13 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
 
     decrypt_result = run_vendor_script("decrypt_db.py")
     if not decrypt_result.get("ok"):
+        log_operation(
+            "解析失败",
+            reason="decrypt_failed",
+            returncode=decrypt_result.get("returncode"),
+            stderr=(decrypt_result.get("stderr") or "")[:300],
+            stdout=(decrypt_result.get("stdout") or "")[:300],
+        )
         return {
             "ok": False,
             "error": "解析失败",
@@ -790,6 +887,7 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
         }
 
     contacts = list_contacts()
+    log_operation("解析完成", source=source, target_dir=str(target_dir), contact_count=len(contacts))
     logs.extend([
         "聊天记录已经解析完成。",
         f"已准备好 {len(contacts)} 个联系人。",
@@ -809,6 +907,8 @@ class AppHandler(SimpleHTTPRequestHandler):
         mark_activity()
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        if not parsed.path.startswith("/api/health"):
+            log_operation("收到 GET 请求", path=parsed.path, query={key: value[:2] for key, value in query.items()})
         if parsed.path == "/api/health":
             return self.send_json({"ok": True, "host": HOST, "port": PORT})
         if parsed.path == "/api/wechat/accounts":
@@ -816,10 +916,14 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/wechat/runtime":
             return self.send_json(runtime_status())
         if parsed.path == "/api/wechat/contacts":
-            return self.send_json({"items": list_contacts()})
+            items = list_contacts()
+            log_operation("联系人列表已返回", count=len(items))
+            return self.send_json({"items": items})
         if parsed.path == "/api/wechat/analyze":
             username = (query.get("username") or [""])[0]
-            return self.send_json(analyze_contact(username, DEFAULT_GAP_HOURS))
+            result = analyze_contact(username, DEFAULT_GAP_HOURS)
+            log_operation("联系人分析完成", username=username, ready=result.get("ready"), message_count=result.get("message_count"), session_count=result.get("session_count"))
+            return self.send_json(result)
         return super().do_GET()
 
     def do_POST(self) -> None:
@@ -828,6 +932,20 @@ class AppHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed.query)
         index_raw = (query.get("index") or [""])[0].strip()
         manual_dir = (query.get("manual_dir") or [""])[0]
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        body = {}
+        if content_length:
+            try:
+                raw_body = self.rfile.read(content_length)
+                body = json.loads(raw_body.decode("utf-8"))
+            except Exception:
+                body = {}
+        log_operation(
+            "收到 POST 请求",
+            path=parsed.path,
+            query={key: value[:2] for key, value in query.items()},
+            body=body,
+        )
         if parsed.path == "/api/wechat/configure":
             index = int((query.get("index") or ["1"])[0])
             try:
@@ -852,6 +970,11 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/wechat/parse":
             index = int(index_raw) if index_raw.isdigit() else None
             return self.send_json(auto_parse(index=index, manual_dir=manual_dir))
+        if parsed.path == "/api/log":
+            event = str(body.get("event") or "").strip()[:100]
+            details = body.get("details") if isinstance(body.get("details"), dict) else {}
+            log_operation("前端事件", event=event or "unknown", details=details)
+            return self.send_json({"ok": True})
         self.send_json({"ok": False, "error": "unknown route"}, HTTPStatus.NOT_FOUND)
 
     def end_headers(self) -> None:
