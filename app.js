@@ -108,6 +108,9 @@ async function runOneClickParse() {
   await logClientEvent("parse_response", {
     ok: Boolean(payload.ok),
     error: payload.error || "",
+    reason: payload.reason || "",
+    reasonDetail: payload.reason_detail || "",
+    reasonLabel: payload.reason_label || "",
     tips: payload.tips || [],
     contactCount: payload.contact_count || 0,
   });
@@ -116,7 +119,7 @@ async function runOneClickParse() {
     setProgress(100, "解析完成，可以直接选择联系人了");
   } else {
     const firstTip = payload.tips && payload.tips.length ? payload.tips[0] : "";
-    const failedText = firstTip || "请先登录微信后再试";
+    const failedText = payload.reason_label || firstTip || "请先登录微信后再试";
     setProgress(0, `解析失败，${failedText}`);
   }
   await refreshRuntime();

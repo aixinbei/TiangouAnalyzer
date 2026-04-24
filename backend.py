@@ -19,6 +19,7 @@ import builtins
 import socket
 from builtins import open as builtin_open
 from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
 from http import HTTPStatus
@@ -34,7 +35,6 @@ ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 HOST = "127.0.0.1"
 PORT = 8876
 PORT_CANDIDATES = [8876, 8877, 8878, 8879, 8880]
-IDLE_EXIT_SECONDS = 120
 LOCAL_VENDOR = ROOT / "vendor" / "wechat-decrypt"
 SHARED_VENDOR = ROOT.parent / "vendor" / "wechat-decrypt"
 VENDOR_ROOT = LOCAL_VENDOR if LOCAL_VENDOR.exists() else SHARED_VENDOR
@@ -44,6 +44,8 @@ LAST_ACTIVITY_AT = time.time()
 HAS_CLIENT_ACTIVITY = False
 MEMORY_KEYS_RESULT: dict[str, Any] | None = None
 WECHAT_PROCESS_CANDIDATES = ("Weixin.exe", "WeChat.exe", "WeixinAppEx.exe")
+ACTIVE_LONG_TASKS = 0
+ACTIVE_LONG_TASKS_LOCK = threading.Lock()
 
 
 def mark_activity() -> None:
@@ -53,18 +55,7 @@ def mark_activity() -> None:
 
 
 def start_idle_shutdown_watch(server: ThreadingHTTPServer) -> None:
-    def watch() -> None:
-        while True:
-            time.sleep(5)
-            if not HAS_CLIENT_ACTIVITY:
-                continue
-            if time.time() - LAST_ACTIVITY_AT < IDLE_EXIT_SECONDS:
-                continue
-            print(f"No browser activity for {IDLE_EXIT_SECONDS} seconds, shutting down.")
-            server.shutdown()
-            return
-
-    threading.Thread(target=watch, name="idle-shutdown-watch", daemon=True).start()
+    return
 
 
 def get_home() -> Path:
@@ -292,13 +283,16 @@ def ensure_vendor_config(msg_dir: Path) -> dict[str, Any]:
     return config
 
 
-def cleanup_sensitive_artifacts(clear_memory_keys: bool = True) -> None:
+def cleanup_sensitive_artifacts(clear_memory_keys: bool = True, remove_config: bool = True) -> None:
     try:
         if DECRYPTED_DIR.exists():
             shutil.rmtree(DECRYPTED_DIR, ignore_errors=True)
     except Exception:
         pass
-    for filename in ("all_keys.json", "config.json"):
+    files_to_remove = ["all_keys.json"]
+    if remove_config:
+        files_to_remove.append("config.json")
+    for filename in files_to_remove:
         try:
             file_path = VENDOR_ROOT / filename
             if file_path.exists():
@@ -335,6 +329,20 @@ def append_debug_log(message: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     with (log_dir / "debug.log").open("a", encoding="utf-8") as fh:
         fh.write(line)
+
+
+@contextmanager
+def long_task(name: str):
+    global ACTIVE_LONG_TASKS
+    with ACTIVE_LONG_TASKS_LOCK:
+        ACTIVE_LONG_TASKS += 1
+    append_runtime_log(f"{name}开始")
+    try:
+        yield
+    finally:
+        append_runtime_log(f"{name}结束")
+        with ACTIVE_LONG_TASKS_LOCK:
+            ACTIVE_LONG_TASKS = max(0, ACTIVE_LONG_TASKS - 1)
 
 
 def log_operation(stage: str, debug_only: bool = False, **fields: Any) -> None:
@@ -381,6 +389,112 @@ def log_client_event(event: str, details: dict[str, Any]) -> None:
     log_operation("前端事件", debug_only=True, event=event or "unknown", details=details)
 
 
+class TeeLineWriter(io.StringIO):
+    def __init__(self, script_name: str, is_stderr: bool = False) -> None:
+        super().__init__()
+        self.script_name = script_name
+        self.is_stderr = is_stderr
+        self._pending = ""
+
+    def write(self, s: str) -> int:
+        text = str(s)
+        written = super().write(text)
+        self._pending += text
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            emit_vendor_progress(self.script_name, line, self.is_stderr)
+        return written
+
+    def flush_pending(self) -> None:
+        if self._pending.strip():
+            emit_vendor_progress(self.script_name, self._pending, self.is_stderr)
+        self._pending = ""
+
+
+def emit_vendor_progress(script_name: str, raw_line: str, is_stderr: bool = False) -> None:
+    line = str(raw_line or "").strip()
+    if not line:
+        return
+    prefix = "stderr" if is_stderr else "stdout"
+    append_debug_log(f"[{script_name}:{prefix}] {line}")
+
+    # Turn low-level decryptor output into a few user-readable progress lines.
+    if script_name == "find_all_keys.py":
+        if "未提取到任何密钥" in line:
+            append_runtime_log("没有提取到可用解密信息")
+        elif "密钥已暂存在程序内存中" in line:
+            append_runtime_log("已拿到解密所需信息")
+        elif line.startswith("结果:"):
+            append_runtime_log(f"解密信息提取结果：{line}")
+        elif line.startswith("OK:"):
+            append_runtime_log(f"已识别数据库：{line[3:].strip()}")
+    elif script_name == "decrypt_db.py":
+        if line.startswith("解密:"):
+            append_runtime_log(f"正在处理：{line[3:].strip()}")
+        elif "进度:" in line:
+            append_runtime_log(f"解密进度：{line}")
+        elif line.startswith("结果:"):
+            append_runtime_log(f"解密结果：{line}")
+        elif "共 " in line and "个" in line and "表" in line and "OK!" in line:
+            append_runtime_log("一个数据库文件已处理完成")
+
+
+def classify_vendor_failure(script_name: str, result: dict[str, Any]) -> dict[str, str]:
+    stdout = str(result.get("stdout") or "")
+    stderr = str(result.get("stderr") or "")
+    combined = "\n".join(part for part in [stdout, stderr] if part).strip()
+
+    if script_name == "find_all_keys.py":
+        if "未检测到微信进程" in combined or "Weixin.exe" in combined:
+            return {
+                "detail_code": "wechat_process_not_found",
+                "detail_label": "没有检测到正在运行的微信",
+                "user_message": "没有检测到正在运行的微信，请先打开并登录微信。",
+            }
+        if "未提取到任何密钥" in combined or "未能从任何微信进程中提取到密钥" in combined:
+            return {
+                "detail_code": "no_keys_extracted",
+                "detail_label": "没有拿到可用的解密信息",
+                "user_message": "已经找到聊天记录目录，但这次没有拿到可用的解密信息。",
+            }
+        if "Access is denied" in combined or "拒绝访问" in combined:
+            return {
+                "detail_code": "permission_denied",
+                "detail_label": "读取微信进程时权限不足",
+                "user_message": "读取微信时权限不足，请尝试重新打开程序和微信后再试。",
+            }
+        return {
+            "detail_code": "keys_unknown",
+            "detail_label": "提取解密信息失败",
+            "user_message": "提取解密信息失败，请确认微信已经登录后再试。",
+        }
+
+    if script_name == "decrypt_db.py":
+        if "内存中没有可用的密钥" in combined:
+            return {
+                "detail_code": "missing_memory_keys",
+                "detail_label": "没有可用的解密信息",
+                "user_message": "这次没有拿到可用的解密信息，请重新点一次解析。",
+            }
+        if "file is not a database" in combined or "database disk image is malformed" in combined:
+            return {
+                "detail_code": "database_decode_failed",
+                "detail_label": "数据库读取失败",
+                "user_message": "数据库读取失败，请关闭微信后重新打开，再试一次。",
+            }
+        return {
+            "detail_code": "decrypt_unknown",
+            "detail_label": "解密数据库失败",
+            "user_message": "解密数据库失败，请确认微信已完全登录后再试。",
+        }
+
+    return {
+        "detail_code": "unknown",
+        "detail_label": "未知错误",
+        "user_message": "这次解析失败了，请稍后再试。",
+    }
+
+
 def create_server() -> ThreadingHTTPServer:
     global PORT
     last_error: Exception | None = None
@@ -412,10 +526,12 @@ def run_vendor_script(script_name: str) -> dict[str, Any]:
     if not VENDOR_ROOT.exists():
         return {"ok": False, "stdout": "", "stderr": "缺少解密器目录"}
     if script_name in {"find_all_keys.py", "decrypt_db.py"}:
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
+        stdout_buffer = TeeLineWriter(script_name, is_stderr=False)
+        stderr_buffer = TeeLineWriter(script_name, is_stderr=True)
         with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
             returncode = run_vendor_script_inline(script_name)
+        stdout_buffer.flush_pending()
+        stderr_buffer.flush_pending()
         if script_name == "decrypt_db.py":
             get_message_table_index.cache_clear()
         return {
@@ -462,7 +578,7 @@ def run_vendor_script_inline(script_name: str) -> int:
             os.environ["PATH"] = system32 + os.pathsep + previous_env_path
         try:
             if script_name == "find_all_keys.py":
-                cleanup_sensitive_artifacts(clear_memory_keys=False)
+                cleanup_sensitive_artifacts(clear_memory_keys=False, remove_config=False)
                 import importlib
 
                 key_scan_common = importlib.import_module("key_scan_common")
@@ -881,132 +997,150 @@ def list_contacts() -> list[dict[str, Any]]:
 
 
 def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]:
-    log_operation("解析开始", mode="manual" if manual_dir.strip() else ("selected" if index is not None else "auto"), manual_dir=manual_dir)
-    problems = vendor_ready()
-    if problems:
-        log_operation("解析失败", reason="vendor_not_ready", problems=problems)
-        return {
-            "ok": False,
-            "error": "程序运行环境还没准备好",
-            "tips": ["先运行 install_deps.bat，把需要的依赖装好。"],
-        }
+    with long_task("解析任务"):
+        log_operation("解析开始", mode="manual" if manual_dir.strip() else ("selected" if index is not None else "auto"), manual_dir=manual_dir)
+        problems = vendor_ready()
+        if problems:
+            log_operation("解析失败", reason="vendor_not_ready", problems=problems)
+            return {
+                "ok": False,
+                "error": "程序运行环境还没准备好",
+                "tips": ["先运行 install_deps.bat，把需要的依赖装好。"],
+            }
 
-    if not is_wechat_logged_in():
-        log_operation("解析失败", reason="wechat_not_logged_in")
-        return {
-            "ok": False,
-            "error": "解析失败",
-            "tips": [
-                "请先打开并登录微信。",
-                "登录完成后，再点一次“解析本地聊天记录”。",
-            ],
-            "show_manual_dir": False,
-        }
+        if not is_wechat_logged_in():
+            log_operation("解析失败", reason="wechat_not_logged_in")
+            return {
+                "ok": False,
+                "error": "解析失败",
+                "tips": [
+                    "请先打开并登录微信。",
+                    "登录完成后，再点一次“解析本地聊天记录”。",
+                ],
+                "show_manual_dir": False,
+            }
 
-    try:
-        target_dir, source = resolve_target_dir(index=index, manual_dir=manual_dir)
-        config = ensure_vendor_config(target_dir)
-        log_operation("目录已确定", source=source, target_dir=str(target_dir))
-    except Exception as exc:
-        log_operation("解析失败", reason="resolve_target_dir_failed", error=str(exc), manual_dir=manual_dir, index=index)
-        tips = ["请确认你选的是微信聊天记录所在目录后再试。"]
-        if manual_dir.strip():
-            tips = [
-                "这个目录里没有找到可用的微信聊天记录。",
-                "请确认你选的是微信聊天记录所在目录后再试。",
-            ]
-        return {
-            "ok": False,
-            "error": str(exc),
-            "tips": tips,
-            "show_manual_dir": True if manual_dir.strip() else True,
-        }
+        try:
+            target_dir, source = resolve_target_dir(index=index, manual_dir=manual_dir)
+            config = ensure_vendor_config(target_dir)
+            log_operation("目录已确定", source=source, target_dir=str(target_dir))
+        except Exception as exc:
+            log_operation("解析失败", reason="resolve_target_dir_failed", error=str(exc), manual_dir=manual_dir, index=index)
+            tips = ["请确认你选的是微信聊天记录所在目录后再试。"]
+            if manual_dir.strip():
+                tips = [
+                    "这个目录里没有找到可用的微信聊天记录。",
+                    "请确认你选的是微信聊天记录所在目录后再试。",
+                ]
+            return {
+                "ok": False,
+                "error": str(exc),
+                "tips": tips,
+                "show_manual_dir": True if manual_dir.strip() else True,
+            }
 
-    logs: list[str] = [
-        "已找到可用的微信聊天记录目录。",
-        "正在读取当前登录微信的数据。",
-    ]
-    if source == "manual":
-        logs.insert(0, "这次使用的是你手动提供的目录。")
+        logs: list[str] = [
+            "已找到可用的微信聊天记录目录。",
+            "正在读取当前登录微信的数据。",
+        ]
+        if source == "manual":
+            logs.insert(0, "这次使用的是你手动提供的目录。")
 
-    key_result = run_vendor_script("find_all_keys.py")
-    if not key_result.get("ok"):
-        log_operation(
-            "解析失败",
-            reason="keys_failed",
-            returncode=key_result.get("returncode"),
-            stderr=(key_result.get("stderr") or "")[:300],
-            stdout=(key_result.get("stdout") or "")[:300],
-        )
+        append_runtime_log("开始提取解密所需信息")
+        key_result = run_vendor_script("find_all_keys.py")
+        if not key_result.get("ok"):
+            failure = classify_vendor_failure("find_all_keys.py", key_result)
+            log_operation(
+                "解析失败",
+                reason="keys_failed",
+                reason_detail=failure["detail_code"],
+                reason_label=failure["detail_label"],
+                returncode=key_result.get("returncode"),
+                stderr=(key_result.get("stderr") or "")[:300],
+                stdout=(key_result.get("stdout") or "")[:300],
+            )
+            append_runtime_log(f"解析失败原因：{failure['detail_label']}")
+            return {
+                "ok": False,
+                "error": "解析失败",
+                "reason": "keys_failed",
+                "reason_detail": failure["detail_code"],
+                "reason_label": failure["detail_label"],
+                "log": "\n".join(item for item in logs if item),
+                "tips": [
+                    failure["user_message"],
+                    "请确认微信已经完全登录，等几秒后再点一次解析。",
+                    "如果还是不行，重新打开微信后再试一次。"
+                ],
+                "config": config,
+                "show_manual_dir": False,
+            }
+
+        append_runtime_log("开始解密并读取数据库")
+        decrypt_result = run_vendor_script("decrypt_db.py")
+        if not decrypt_result.get("ok"):
+            failure = classify_vendor_failure("decrypt_db.py", decrypt_result)
+            log_operation(
+                "解析失败",
+                reason="decrypt_failed",
+                reason_detail=failure["detail_code"],
+                reason_label=failure["detail_label"],
+                returncode=decrypt_result.get("returncode"),
+                stderr=(decrypt_result.get("stderr") or "")[:300],
+                stdout=(decrypt_result.get("stdout") or "")[:300],
+            )
+            append_runtime_log(f"解析失败原因：{failure['detail_label']}")
+            return {
+                "ok": False,
+                "error": "解析失败",
+                "reason": "decrypt_failed",
+                "reason_detail": failure["detail_code"],
+                "reason_label": failure["detail_label"],
+                "log": "\n".join(item for item in logs if item),
+                "tips": [
+                    failure["user_message"],
+                    "如果微信刚同步了聊天记录，再点一次试试。",
+                    "必要时重新打开微信后重试。"
+                ],
+                "config": config,
+                "show_manual_dir": False,
+            }
+
+        append_runtime_log("开始整理联系人列表")
+        contacts = list_contacts()
+        if not contacts:
+            decrypted_status = get_wechat_decrypted_status()
+            log_operation(
+                "解析失败",
+                reason="empty_contacts_after_parse",
+                source=source,
+                target_dir=str(target_dir),
+                decrypted_status=decrypted_status,
+            )
+            return {
+                "ok": False,
+                "error": "解析失败",
+                "log": "\n".join(item for item in logs if item),
+                "tips": [
+                    "这次没有读到可用联系人。",
+                    "请确认微信已经完全登录，并等几秒后再点一次解析。",
+                ],
+                "config": config,
+                "show_manual_dir": False,
+            }
+        log_operation("解析完成", source=source, target_dir=str(target_dir), contact_count=len(contacts))
+        logs.extend([
+            "聊天记录已经解析完成。",
+            f"已准备好 {len(contacts)} 个联系人。",
+        ])
         return {
-            "ok": False,
-            "error": "解析失败",
+            "ok": True,
             "log": "\n".join(item for item in logs if item),
-            "tips": [
-                "请先打开并登录微信后再试。",
-                "如果刚登录微信，等几秒再点一次。",
-                "必要时重新打开微信后重试。"
-            ],
             "config": config,
-            "show_manual_dir": False,
+            "contact_count": len(contacts),
+            "contacts_ready": bool(contacts),
+            "tips": ["解析完成，下面已经可以直接选择联系人了。"],
         }
-
-    decrypt_result = run_vendor_script("decrypt_db.py")
-    if not decrypt_result.get("ok"):
-        log_operation(
-            "解析失败",
-            reason="decrypt_failed",
-            returncode=decrypt_result.get("returncode"),
-            stderr=(decrypt_result.get("stderr") or "")[:300],
-            stdout=(decrypt_result.get("stdout") or "")[:300],
-        )
-        return {
-            "ok": False,
-            "error": "解析失败",
-            "log": "\n".join(item for item in logs if item),
-            "tips": [
-                "请先确认微信已经登录。",
-                "如果微信刚同步了聊天记录，再点一次试试。",
-                "必要时重新打开微信后重试。"
-            ],
-            "config": config,
-            "show_manual_dir": False,
-        }
-
-    contacts = list_contacts()
-    if not contacts:
-        decrypted_status = get_wechat_decrypted_status()
-        log_operation(
-            "解析失败",
-            reason="empty_contacts_after_parse",
-            source=source,
-            target_dir=str(target_dir),
-            decrypted_status=decrypted_status,
-        )
-        return {
-            "ok": False,
-            "error": "解析失败",
-            "log": "\n".join(item for item in logs if item),
-            "tips": [
-                "这次没有读到可用联系人。",
-                "请确认微信已经完全登录，并等几秒后再点一次解析。",
-            ],
-            "config": config,
-            "show_manual_dir": False,
-        }
-    log_operation("解析完成", source=source, target_dir=str(target_dir), contact_count=len(contacts))
-    logs.extend([
-        "聊天记录已经解析完成。",
-        f"已准备好 {len(contacts)} 个联系人。",
-    ])
-    return {
-        "ok": True,
-        "log": "\n".join(item for item in logs if item),
-        "config": config,
-        "contact_count": len(contacts),
-        "contacts_ready": bool(contacts),
-        "tips": ["解析完成，下面已经可以直接选择联系人了。"],
-    }
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -1107,8 +1241,7 @@ def main() -> None:
     cleanup_sensitive_artifacts(clear_memory_keys=True)
     append_runtime_log("已清理上次运行残留")
     server = create_server()
-    start_idle_shutdown_watch(server)
-    append_runtime_log("空闲自动退出监视已启动")
+    append_runtime_log("已关闭自动退出，等待用户手动关闭程序")
     print(f"WeChat easy analyzer running at http://{HOST}:{PORT}")
     append_runtime_log(f"准备打开浏览器: http://{HOST}:{PORT}")
     threading.Timer(0.8, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
