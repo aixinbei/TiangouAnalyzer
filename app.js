@@ -52,7 +52,7 @@ async function boot() {
     await refreshRuntime();
   } catch (error) {
     await logClientEvent("boot_failed", { message: String(error && error.message || error) });
-    els.runtimeText.textContent = "还没有启动成功，请先运行 start_app.bat";
+    els.runtimeText.textContent = "本地程序还没有启动成功，请先打开程序后再试";
   }
 }
 
@@ -78,6 +78,10 @@ async function refreshRuntime() {
 async function runOneClickParse() {
   const manualDir = els.manualDir.value.trim();
   await logClientEvent("parse_clicked", { hasManualDir: Boolean(manualDir), manualDir });
+  const healthOk = await ensureBackendReady("解析前检查失败，本地程序可能已经退出了，请重新打开后再试");
+  if (!healthOk) {
+    return;
+  }
   const params = new URLSearchParams();
   if (manualDir) {
     params.set("manual_dir", manualDir);
@@ -91,8 +95,16 @@ async function runOneClickParse() {
   const timers = progressMessages.map((item) =>
     setTimeout(() => setProgress(item.percent, item.text), item.delay),
   );
-  const res = await fetch(`/api/wechat/parse?${params.toString()}`, { method: "POST" });
-  const payload = await res.json();
+  let payload;
+  try {
+    const res = await fetch(`/api/wechat/parse?${params.toString()}`, { method: "POST" });
+    payload = await res.json();
+  } catch (error) {
+    timers.forEach((timer) => clearTimeout(timer));
+    await logClientEvent("parse_request_failed", { message: String(error && error.message || error) });
+    setProgress(0, "解析失败，本地程序可能已经退出了，请重新打开后再试");
+    return;
+  }
   await logClientEvent("parse_response", {
     ok: Boolean(payload.ok),
     error: payload.error || "",
@@ -110,29 +122,58 @@ async function runOneClickParse() {
   await refreshRuntime();
   if (payload.ok) {
     await loadContacts();
-  } else if (!els.manualDir.value.trim()) {
+  } else if (payload.show_manual_dir) {
     els.manualDirBlock.classList.remove("hidden");
   }
 }
 
+async function ensureBackendReady(fallbackMessage) {
+  try {
+    const res = await fetch("/api/health", { cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(`health ${res.status}`);
+    }
+    return true;
+  } catch (error) {
+    await logClientEvent("health_check_failed", { message: String(error && error.message || error) });
+    els.runtimeText.textContent = fallbackMessage;
+    setProgress(0, fallbackMessage);
+    return false;
+  }
+}
+
 async function loadContacts() {
-  const res = await fetch("/api/wechat/contacts", { cache: "no-store" });
-  const payload = await res.json();
-  await logClientEvent("contacts_loaded", { count: (payload.items || []).length });
-  state.contacts = (payload.items || []).map((item) => ({
-    id: item.username,
-    name: item.display_name,
-    username: item.username,
-    loaded: false,
-    sessions: [],
-    selfStarts: 0,
-    otherStarts: 0,
-    range: "-",
-  }));
-  state.selectedContactId = null;
-  state.selectedSessionIndex = null;
-  renderContacts();
-  renderResult();
+  try {
+    const res = await fetch("/api/wechat/contacts", { cache: "no-store" });
+    const payload = await res.json();
+    const items = payload.items || [];
+    await logClientEvent("contacts_loaded", { count: items.length });
+    state.contacts = items.map((item) => ({
+      id: item.username,
+      name: item.display_name,
+      username: item.username,
+      loaded: false,
+      sessions: [],
+      selfStarts: 0,
+      otherStarts: 0,
+      range: "-",
+    }));
+    state.selectedContactId = null;
+    state.selectedSessionIndex = null;
+    if (!items.length) {
+      els.runtimeText.textContent = "这次没有读到可用联系人，请重新点一次解析";
+    }
+    renderContacts();
+    renderResult();
+  } catch (error) {
+    await logClientEvent("contacts_load_failed", { message: String(error && error.message || error) });
+    els.runtimeText.textContent = "联系人列表加载失败，请重新点一次解析";
+    state.contacts = [];
+    state.selectedContactId = null;
+    state.selectedSessionIndex = null;
+    renderContacts();
+    renderResult();
+  }
 }
 
 function renderContacts() {

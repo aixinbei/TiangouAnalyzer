@@ -43,6 +43,7 @@ DECRYPTED_DIR = VENDOR_ROOT / "decrypted"
 LAST_ACTIVITY_AT = time.time()
 HAS_CLIENT_ACTIVITY = False
 MEMORY_KEYS_RESULT: dict[str, Any] | None = None
+WECHAT_PROCESS_CANDIDATES = ("Weixin.exe", "WeChat.exe", "WeixinAppEx.exe")
 
 
 def mark_activity() -> None:
@@ -68,6 +69,26 @@ def start_idle_shutdown_watch(server: ThreadingHTTPServer) -> None:
 
 def get_home() -> Path:
     return Path(os.environ.get("USERPROFILE", str(Path.home())))
+
+
+def is_wechat_logged_in() -> bool:
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return False
+
+    if completed.returncode != 0:
+        return False
+
+    output = completed.stdout.lower()
+    return any(name.lower() in output for name in WECHAT_PROCESS_CANDIDATES)
 
 
 def find_xwechat_db_dirs() -> list[Path]:
@@ -306,9 +327,58 @@ def append_runtime_log(message: str) -> None:
         fh.write(line)
 
 
-def log_operation(stage: str, **fields: Any) -> None:
+def append_debug_log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+    executable_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+    log_dir = executable_dir / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "debug.log").open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def log_operation(stage: str, debug_only: bool = False, **fields: Any) -> None:
     detail = " ".join(f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in fields.items())
-    append_runtime_log(f"{stage}{' | ' + detail if detail else ''}")
+    line = f"{stage}{' | ' + detail if detail else ''}"
+    if not debug_only:
+        append_runtime_log(line)
+    append_debug_log(line)
+
+
+def log_client_event(event: str, details: dict[str, Any]) -> None:
+    event = (event or "").strip()
+    if event == "page_boot":
+        append_runtime_log("页面已打开")
+    elif event == "runtime_refreshed":
+        append_runtime_log("页面状态已刷新")
+    elif event == "parse_clicked":
+        if details.get("hasManualDir"):
+            append_runtime_log("用户点击了解析，并手动填写了聊天记录目录")
+        else:
+            append_runtime_log("用户点击了解析")
+    elif event == "parse_response":
+        if details.get("ok"):
+            append_runtime_log(f"解析成功，已准备好 {details.get('contactCount', 0)} 个联系人")
+        else:
+            append_runtime_log(f"解析失败：{details.get('error') or '请先登录微信后再试'}")
+    elif event == "contacts_loaded":
+        append_runtime_log(f"联系人列表已加载，共 {details.get('count', 0)} 人")
+    elif event == "contact_selected":
+        append_runtime_log("用户选择了一个联系人")
+    elif event == "analyze_clicked":
+        append_runtime_log("开始分析当前联系人")
+    elif event == "analyze_response":
+        if details.get("ready"):
+            append_runtime_log(
+                f"联系人分析完成：消息 {details.get('messageCount', 0)} 条，对话轮次 {details.get('sessionCount', 0)} 段"
+            )
+        else:
+            append_runtime_log("联系人分析失败，暂时没有拿到可用结果")
+    elif event == "session_toggle":
+        append_runtime_log("用户查看了某一轮的详细消息")
+    elif event == "boot_failed":
+        append_runtime_log("页面初始化失败")
+    log_operation("前端事件", debug_only=True, event=event or "unknown", details=details)
 
 
 def create_server() -> ThreadingHTTPServer:
@@ -821,20 +891,35 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
             "tips": ["先运行 install_deps.bat，把需要的依赖装好。"],
         }
 
+    if not is_wechat_logged_in():
+        log_operation("解析失败", reason="wechat_not_logged_in")
+        return {
+            "ok": False,
+            "error": "解析失败",
+            "tips": [
+                "请先打开并登录微信。",
+                "登录完成后，再点一次“解析本地聊天记录”。",
+            ],
+            "show_manual_dir": False,
+        }
+
     try:
         target_dir, source = resolve_target_dir(index=index, manual_dir=manual_dir)
         config = ensure_vendor_config(target_dir)
         log_operation("目录已确定", source=source, target_dir=str(target_dir))
     except Exception as exc:
         log_operation("解析失败", reason="resolve_target_dir_failed", error=str(exc), manual_dir=manual_dir, index=index)
+        tips = ["请确认你选的是微信聊天记录所在目录后再试。"]
+        if manual_dir.strip():
+            tips = [
+                "这个目录里没有找到可用的微信聊天记录。",
+                "请确认你选的是微信聊天记录所在目录后再试。",
+            ]
         return {
             "ok": False,
             "error": str(exc),
-            "tips": [
-                "先打开并登录微信。",
-                "再点一次“一键解析”。",
-                "如果还是找不到，就手动输入微信聊天记录目录。"
-            ],
+            "tips": tips,
+            "show_manual_dir": True if manual_dir.strip() else True,
         }
 
     logs: list[str] = [
@@ -863,6 +948,7 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
                 "必要时重新打开微信后重试。"
             ],
             "config": config,
+            "show_manual_dir": False,
         }
 
     decrypt_result = run_vendor_script("decrypt_db.py")
@@ -884,9 +970,30 @@ def auto_parse(index: int | None = None, manual_dir: str = "") -> dict[str, Any]
                 "必要时重新打开微信后重试。"
             ],
             "config": config,
+            "show_manual_dir": False,
         }
 
     contacts = list_contacts()
+    if not contacts:
+        decrypted_status = get_wechat_decrypted_status()
+        log_operation(
+            "解析失败",
+            reason="empty_contacts_after_parse",
+            source=source,
+            target_dir=str(target_dir),
+            decrypted_status=decrypted_status,
+        )
+        return {
+            "ok": False,
+            "error": "解析失败",
+            "log": "\n".join(item for item in logs if item),
+            "tips": [
+                "这次没有读到可用联系人。",
+                "请确认微信已经完全登录，并等几秒后再点一次解析。",
+            ],
+            "config": config,
+            "show_manual_dir": False,
+        }
     log_operation("解析完成", source=source, target_dir=str(target_dir), contact_count=len(contacts))
     logs.extend([
         "聊天记录已经解析完成。",
@@ -908,7 +1015,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         if not parsed.path.startswith("/api/health"):
-            log_operation("收到 GET 请求", path=parsed.path, query={key: value[:2] for key, value in query.items()})
+            log_operation("收到 GET 请求", debug_only=True, path=parsed.path, query={key: value[:2] for key, value in query.items()})
         if parsed.path == "/api/health":
             return self.send_json({"ok": True, "host": HOST, "port": PORT})
         if parsed.path == "/api/wechat/accounts":
@@ -942,6 +1049,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 body = {}
         log_operation(
             "收到 POST 请求",
+            debug_only=True,
             path=parsed.path,
             query={key: value[:2] for key, value in query.items()},
             body=body,
@@ -973,7 +1081,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/log":
             event = str(body.get("event") or "").strip()[:100]
             details = body.get("details") if isinstance(body.get("details"), dict) else {}
-            log_operation("前端事件", event=event or "unknown", details=details)
+            log_client_event(event, details)
             return self.send_json({"ok": True})
         self.send_json({"ok": False, "error": "unknown route"}, HTTPStatus.NOT_FOUND)
 
