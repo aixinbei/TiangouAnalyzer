@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# local packaging/cache
+.build_vendor/
+.packenv/
+build/
+dist/
+release/
+
+# generated spec files
+*.spec
+
+# local packaging script
+build_exe.ps1

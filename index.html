@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>舔狗程度分析器</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">只支持微信</p>
+          <h1>舔狗程度分析器</h1>
+          <p class="muted">看看你跟你的朋友之间谁是舔狗。</p>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel">
+          <h2>1. 登录微信后点击解析</h2>
+          <div class="toolbar">
+            <button id="parseBtn" class="primary-btn">解析本地聊天记录</button>
+            <span id="runtimeText" class="muted">请先打开并登录微信。</span>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-bar">
+              <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+            </div>
+            <div id="progressText" class="muted">等待开始</div>
+          </div>
+          <div id="manualDirBlock" class="manual-dir-block hidden">
+            <div class="toolbar">
+              <button id="showManualDirBtn" class="ghost-btn">还是没找到？我来手动选目录</button>
+            </div>
+            <div id="manualDirForm" class="form-grid manual-dir-grid hidden">
+              <label>
+                <span>微信聊天记录目录</span>
+                <input id="manualDir" type="text" placeholder="把你的微信聊天记录目录粘贴到这里" />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>2. 选择联系人</h2>
+          <div class="toolbar">
+            <button id="loadContactsBtn" class="ghost-btn">重新加载联系人</button>
+            <input id="contactSearch" type="search" placeholder="搜索联系人" />
+          </div>
+          <div id="contactList" class="card-list empty-state">一键解析成功后，这里会自动出现联系人。</div>
+        </section>
+
+        <section class="panel results-panel">
+          <h2>3. 分析结果</h2>
+          <div id="resultEmpty" class="empty-state">选中联系人后，这里会显示分析结果。</div>
+          <div id="resultContent" class="hidden">
+            <div class="stats-grid">
+              <article class="stat-card">
+                <div class="label">当前联系人</div>
+                <h3 id="resultName">-</h3>
+                <p id="resultRange" class="muted">-</p>
+              </article>
+              <article class="stat-card verdict-card">
+                <h3 id="resultWinner">-</h3>
+                <p id="resultWinnerMeta" class="muted">-</p>
+              </article>
+              <article class="stat-card">
+                <div class="label">聊天统计</div>
+                <h3 id="messageCount">0</h3>
+                <p id="resultCounts" class="muted">你主动 0 次 · TA 主动 0 次</p>
+              </article>
+            </div>
+
+            <div class="compare-strip">
+              <div class="compare-header">
+                <span>主动发起占比</span>
+                <span id="compareSummary" class="muted">-</span>
+              </div>
+              <div class="compare-bar" aria-hidden="true">
+                <div id="selfShareBar" class="compare-bar-self" style="width: 50%"></div>
+                <div id="otherShareBar" class="compare-bar-other" style="width: 50%"></div>
+              </div>
+              <div class="compare-legend">
+                <div class="compare-legend-item">
+                  <span class="compare-dot self"></span>
+                  <span>你 <strong id="selfShareText">0%</strong></span>
+                </div>
+                <div class="compare-legend-item">
+                  <span class="compare-dot other"></span>
+                  <span>对方 <strong id="otherShareText">0%</strong></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>开始时间</th>
+                    <th>发起人</th>
+                    <th>首条内容</th>
+                    <th>消息数</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody id="sessionTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="page-footer">
+        <span>作者：B站 @未闻之声sv</span>
+        <span>抖音 @未闻之声</span>
+      </footer>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
